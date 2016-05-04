@@ -146,12 +146,12 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
                         //not recoverable, propagate:
                         throw (LoopException) ex;
                     }
-                    //otherwise we can retry, so cleanup:
-                    if (producer != null) {
-                        producer.close();
-                    }
-                    producer = null;
                 }
+                //otherwise we can retry, so cleanup:
+                if (producer != null) {
+                    producer.close();
+                }
+                producer = null;
             }
         );
     }

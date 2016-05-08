@@ -1,5 +1,8 @@
 package com.stormpath.samza.kafka.checkpoint;
 
+import com.stormpath.samza.lang.Assert;
+import com.stormpath.samza.lang.Collections;
+import com.stormpath.samza.lang.Strings;
 import kafka.admin.AdminUtils$;
 import kafka.api.*;
 import kafka.cluster.Broker;
@@ -24,6 +27,7 @@ import org.apache.samza.checkpoint.kafka.KafkaCheckpointLogKey;
 import org.apache.samza.checkpoint.kafka.KafkaCheckpointLogKey$;
 import org.apache.samza.container.TaskName;
 import org.apache.samza.serializers.CheckpointSerde;
+import org.apache.samza.system.SystemStreamPartition;
 import org.apache.samza.system.kafka.TopicMetadataCache$;
 import org.apache.samza.util.ExponentialSleepStrategy;
 import org.apache.samza.util.KafkaUtil$;
@@ -32,6 +36,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import scala.Option;
 import scala.collection.JavaConversions;
+import scala.collection.JavaConversions$;
 
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
@@ -42,9 +47,11 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import static com.stormpath.samza.lang.ScalaUtils.*;
+import static com.stormpath.samza.lang.Assert.hasText;
+import static com.stormpath.samza.lang.Assert.notEmpty;
 
 @SuppressWarnings("Duplicates")
-public class SinglePartitionKafkaCheckpointManager implements CheckpointManager {
+public class PartitionedKafkaCheckpointManager implements CheckpointManager {
 
     static final Logger log = LoggerFactory.getLogger(SinglePartitionKafkaCheckpointManager.class);
 
@@ -53,6 +60,7 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
 
     private final String clientId;
     private final String checkpointTopic;
+    private final Map<String, String> streamCheckpointTopicNames;
     private final String systemName;
     private final int replicationFactor;
     private final int socketTimeout;
@@ -71,17 +79,19 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
     // Where to start reading for each subsequent call of readCheckpoint:
     private Option<Long> startingOffset = scala.Option.apply(null);
 
-    public SinglePartitionKafkaCheckpointManager(String clientId, String checkpointTopic, String systemName,
-                                                 int replicationFactor, int socketTimeout, int bufferSize,
-                                                 int fetchSize, TopicMetadataStore topicMetadataStore,
-                                                 Supplier<Producer<byte[], byte[]>> connectProducer,
-                                                 Supplier<ZkClient> connectZk,
-                                                 String systemStreamPartitionGrouperFactoryString,
-                                                 ExponentialSleepStrategy retryBackoff,
-                                                 CheckpointSerde serde,
-                                                 Properties checkpointTopicProperties) {
+    public PartitionedKafkaCheckpointManager(String clientId, String checkpointTopic,
+                                             Map<String, String> streamCheckpointTopicNames, String systemName,
+                                             int replicationFactor, int socketTimeout, int bufferSize,
+                                             int fetchSize, TopicMetadataStore topicMetadataStore,
+                                             Supplier<Producer<byte[], byte[]>> connectProducer,
+                                             Supplier<ZkClient> connectZk,
+                                             String systemStreamPartitionGrouperFactoryString,
+                                             ExponentialSleepStrategy retryBackoff,
+                                             CheckpointSerde serde,
+                                             Properties checkpointTopicProperties) {
         this.clientId = clientId;
-        this.checkpointTopic = checkpointTopic;
+        this.checkpointTopic = hasText(checkpointTopic, "checkpointTopic cannot be null or empty.");
+        this.streamCheckpointTopicNames = notEmpty(streamCheckpointTopicNames, "streamCheckpointTopicNames cannot be null or empty.");
         this.systemName = systemName;
         this.replicationFactor = replicationFactor;
         this.socketTimeout = socketTimeout;
@@ -97,16 +107,38 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
         KafkaCheckpointLogKey$.MODULE$
             .setSystemStreamPartitionGrouperFactoryString(systemStreamPartitionGrouperFactoryString);
 
-        log.info("Creating SinglePartitionKafkaCheckpointManager with: clientId={}, checkpointTopic={}, systemName={}",
-            new Object[]{this.clientId, this.checkpointTopic, this.systemName});
+        log.info("Instantiated {}", this);
     }
 
     @Override
-    public void writeCheckpoint(TaskName taskName, Checkpoint checkpoint) {
+    public void writeCheckpoint(TaskName taskName, final Checkpoint aggregateStreamCheckpoint) {
+
         final KafkaCheckpointLogKey key = KafkaCheckpointLogKey$.MODULE$.getCheckpointKey(taskName);
+
         final byte[] keyBytes = key.toBytes();
-        final byte[] msgBytes = serde.toBytes(checkpoint);
-        writeLog(CHECKPOINT_LOG4J_ENTRY, keyBytes, msgBytes);
+
+        //might need to 'fan out' to individual topics - one per stream:
+        Map<SystemStreamPartition, String> aggregateOffsets = aggregateStreamCheckpoint.getOffsets();
+
+        for (Map.Entry<SystemStreamPartition, String> entry : aggregateOffsets.entrySet()) {
+
+            SystemStreamPartition partition = entry.getKey();
+
+            final String streamTopicName = partition.getSystemStream().getStream();
+            final String checkpointTopicName = streamCheckpointTopicNames.get(streamTopicName);
+            Assert.notNull(checkpointTopicName, "Unrecognized stream topic " + streamTopicName);
+
+            final int partitionId = partition.getPartition().getPartitionId();
+
+            String offset = entry.getValue();
+
+            Map<SystemStreamPartition, String> map = new HashMap<>(1);
+            map.put(partition, offset);
+            Checkpoint checkpoint = new Checkpoint(map);
+            final byte[] msgBytes = serde.toBytes(checkpoint);
+
+            writeLog(CHECKPOINT_LOG4J_ENTRY, checkpointTopicName, partitionId, keyBytes, msgBytes);
+        }
     }
 
     @Override
@@ -114,7 +146,7 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
         final KafkaCheckpointLogKey key = KafkaCheckpointLogKey$.MODULE$.getChangelogPartitionMappingKey();
         final byte[] keyBytes = key.toBytes();
         final byte[] msgBytes = serde.changelogPartitionMappingToBytes(mapping);
-        writeLog(CHANGELOG_PARTITION_MAPPING_LOG4j, keyBytes, msgBytes);
+        writeLog(CHANGELOG_PARTITION_MAPPING_LOG4j, checkpointTopic, 0, keyBytes, msgBytes);
     }
 
     /**
@@ -124,14 +156,14 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
      * @param key     pre-serialized key for message
      * @param msg     pre-serialized message to write to log
      */
-    private void writeLog(final String logType, final byte[] key, final byte[] msg) {
+    private void writeLog(final String logType, final String topicName, final int partition, final byte[] key, final byte[] msg) {
         retry(
             loop -> {
                 if (producer == null) {
                     producer = connectProducer.get();
                 }
                 try {
-                    producer.send(new ProducerRecord<>(checkpointTopic, 0, key, msg)).get();
+                    producer.send(new ProducerRecord<>(topicName, partition, key, msg)).get();
                 } catch (Throwable t) {
                     throw new LoopException(t);
                 }
@@ -157,37 +189,62 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
         );
     }
 
-    private scala.collection.immutable.Map<String, TopicMetadata> getTopicMetadataMap() {
-        return TopicMetadataCache$.MODULE$.getTopicMetadata(
-            new scala.collection.immutable.Set.Set1<>(checkpointTopic),
-            systemName,
-            funf(topicMetadataStore::getTopicInfo),
-            5000L,
-            fun(System::currentTimeMillis));
+    private Map<String, TopicMetadata> getTopicMetadataMap(Collection<String> topics) {
+
+        Set<String> set = topics instanceof Set ? (Set<String>) topics : new HashSet<>(topics);
+
+        scala.collection.immutable.Map<String, TopicMetadata> map =
+            TopicMetadataCache$.MODULE$.getTopicMetadata(
+                JavaConversions$.MODULE$.asScalaSet(set).toSet(),
+                systemName,
+                funf(topicMetadataStore::getTopicInfo),
+                5000L,
+                fun(System::currentTimeMillis));
+
+        return JavaConversions$.MODULE$.mapAsJavaMap(map);
     }
 
-    private TopicMetadata getTopicMetadata() {
+    private Map<String, TopicMetadata> getValidTopicMetadata(Collection<String> topics) {
 
-        scala.collection.immutable.Map<String, TopicMetadata> metadataMap = getTopicMetadataMap();
+        Map<String, TopicMetadata> metadataMap = getTopicMetadataMap(topics);
 
-        TopicMetadata metadata = require(metadataMap.get(checkpointTopic),
-            "No TopicMetadata for checkpointTopic " + checkpointTopic);
+        for (String topicName : topics) {
+            getValidTopicMetadata(metadataMap, topicName); //validates
+        }
+
+        return metadataMap;
+    }
+
+    private TopicMetadata getValidTopicMetadata(String topicName) {
+        Set<String> set = Collections.setOf(topicName);
+        Map<String, TopicMetadata> metadataMap = getTopicMetadataMap(set);
+        return getValidTopicMetadata(metadataMap, topicName);
+    }
+
+    private TopicMetadata getValidTopicMetadata(Map<String, TopicMetadata> source, String topicName) {
+
+        TopicMetadata metadata = source.get(topicName);
+
+        if (metadata == null) {
+            throw new KafkaCheckpointException("No TopicMetadata for topic " + topicName);
+        }
 
         KafkaUtil$.MODULE$.maybeThrowException(metadata.errorCode());
 
         int len = metadata.partitionsMetadata().length();
 
-        if (len != 1) {
-            String msg = String.format("Checkpoint topic validation failed for topic %s because partition " +
-                "count %s did not match expected partition count of 1.", checkpointTopic, len);
+        if (len <= 0) {
+            String msg = "Topic " + topicName + " does not have any partitions.  At least one is required.";
             throw new KafkaCheckpointException(msg);
         }
 
         return metadata;
     }
 
-    private PartitionMetadata getPartitionMetadata() {
-        TopicMetadata metadata = getTopicMetadata();
+    private PartitionMetadata getPartitionMetadata(String topicName) {
+
+        TopicMetadata metadata = getValidTopicMetadata(topicName);
+
         return JavaConversions.seqAsJavaList(metadata.partitionsMetadata())
             .stream()
             .filter(pm -> pm.partitionId() == 0)
@@ -198,7 +255,7 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
 
     private SimpleConsumer getConsumer() {
 
-        PartitionMetadata partitionMetadata = getPartitionMetadata();
+        PartitionMetadata partitionMetadata = getPartitionMetadata(checkpointTopic);
 
         Broker leader = require(partitionMetadata.leader(), "No leader available for topic " + checkpointTopic);
 
@@ -400,7 +457,7 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
     @Override
     public void start() {
         create();
-        validateTopic();
+        validateTopics();
     }
 
     @Override
@@ -417,55 +474,128 @@ public class SinglePartitionKafkaCheckpointManager implements CheckpointManager 
     }
 
     private void create() {
-        log.info("Attempting to create checkpoint topic {}.", checkpointTopic);
-        retry(
-            loop -> {
-                ZkClient zkClient = connectZk.get();
-                try {
-                    AdminUtils$.MODULE$.createTopic(zkClient, checkpointTopic, 1, replicationFactor, checkpointTopicProperties);
-                } finally {
-                    zkClient.close();
-                }
-                log.info("Created checkpoint topic for {}.", checkpointTopic);
-                loop.done();
-            },
-            (ex, loop) -> {
-                if (ex instanceof TopicExistsException) {
-                    log.info("Checkpoint topic " + checkpointTopic + " already exists.");
+
+        final Set<String> streamTopicNames = streamCheckpointTopicNames.keySet();
+
+        if (log.isInfoEnabled()) {
+            String msg = "Attempting to create checkpoint topics for input stream topics: " +
+                Strings.collectionToCommaDelimitedString(streamTopicNames);
+            log.info(msg);
+        }
+
+        final Map<String, TopicMetadata> validatedMetadata = retryForValidTopicMetadata(streamTopicNames);
+
+        for (final String streamTopicName : streamTopicNames) {
+
+            TopicMetadata streamTopicMetadata = validatedMetadata.get(streamTopicName);
+            Assert.notNull(streamTopicMetadata, "Input stream topic metadata cannot be null.");
+
+            final int partitionCount = streamTopicMetadata.partitionsMetadata().length();
+            Assert.isTrue(partitionCount > 0, "Input stream topic " + streamTopicName + " partition count must be greater than zero.");
+
+            final String checkpointTopicName = streamCheckpointTopicNames.get(streamTopicName);
+
+            retry(
+                loop -> {
+                    ZkClient zkClient = connectZk.get();
+                    try {
+                        AdminUtils$.MODULE$.createTopic(zkClient, checkpointTopicName, partitionCount, replicationFactor, checkpointTopicProperties);
+                    } finally {
+                        zkClient.close();
+                    }
+                    log.info("Created checkpoint topic {} with {} partitions for input stream topic {}",
+                        new Object[]{checkpointTopicName, partitionCount, streamTopicName});
                     loop.done();
-                } else {
-                    String msg = "Failed to create topic " + checkpointTopic + ": " + ex.getMessage() + ".  Retrying.";
-                    log.warn(msg, ex);
+                },
+                (ex, loop) -> {
+                    if (ex instanceof TopicExistsException) {
+                        log.info("Checkpoint topic {} with {} partitions already exists.", checkpointTopicName, partitionCount);
+                        loop.done();
+                    } else {
+                        String msg = "Failed to create topic " + checkpointTopicName + ": " + ex.getMessage() + ".  Retrying.";
+                        log.warn(msg);
+                        log.debug("Exception details: ", ex);
+                    }
                 }
-            }
-        );
+            );
+        }
     }
 
-    private void validateTopic() {
+    private Map<String, TopicMetadata> retryForValidTopicMetadata(Collection<String> topicNames) {
 
-        log.info("Validating checkpoint topic {}.", checkpointTopic);
+        final Map<String, TopicMetadata> map = new HashMap<>();
 
         retry(
             loop -> {
-                //the getPartitionMetadata() method has assertions that will throw exceptions if
-                //expected conditions are not met.  Just calling that method is enough to validate the topic:
-                getPartitionMetadata();
-                log.info("Successfully validated checkpoint topic {}.", checkpointTopic);
+                //Get metadata for the specified topics.
+                Map<String, TopicMetadata> m = getValidTopicMetadata(topicNames);
+                map.putAll(m);
                 loop.done();
             },
             (ex, loop) -> {
                 if (ex instanceof KafkaCheckpointException) {
                     throw (KafkaCheckpointException) ex; //can't retry, propagate
                 }
-                log.warn("Unable to validate topic " + checkpointTopic + ".  Retrying.", ex);
+                log.warn("Unable to get topics metadata.  Message: {}.  Retrying.", ex.getMessage());
+                log.debug("Exception details:", ex);
             }
         );
+
+        if (map.isEmpty()) {
+            String msg = "TopicMetadata map must have been populated during metadata retrieval.";
+            throw new KafkaCheckpointException(msg);
+        }
+        if (map.size() != topicNames.size()) {
+            String msg = "TopicMetadata map must have the same number of specified topic names.";
+            throw new KafkaCheckpointException(msg);
+        }
+
+        return map;
+    }
+
+
+    private void validateTopics() {
+
+        final Set<String> streamTopicNames = streamCheckpointTopicNames.keySet();
+        final Collection<String> checkpointTopicNames = streamCheckpointTopicNames.values();
+        final Set<String> allTopics = new HashSet<>(streamTopicNames.size() + checkpointTopicNames.size());
+        allTopics.addAll(streamTopicNames);
+        allTopics.addAll(checkpointTopicNames);
+
+        final Map<String, TopicMetadata> validatedMetadata = retryForValidTopicMetadata(allTopics);
+
+        for (String streamTopicName : streamTopicNames) {
+
+            TopicMetadata streamTopicMetadata = validatedMetadata.get(streamTopicName);
+
+            //Ensure corresponding checkpoint topic exists and is valid as well:
+            String checkpointTopicName = streamCheckpointTopicNames.get(streamTopicName);
+            TopicMetadata checkpointTopicMetadata = validatedMetadata.get(checkpointTopicName);
+            //should never be null since the name is in the 'allTopics' Set above and used for validation:
+            Assert.notNull(checkpointTopicMetadata, "checkpointTopicMetadata cannot be null.");
+
+            //Ensure that the two topics have the same number of partitions:
+            int streamTopicPartitionCount = streamTopicMetadata.partitionsMetadata().length();
+            int checkpointTopicPartitionCount = checkpointTopicMetadata.partitionsMetadata().length();
+
+            if (streamTopicPartitionCount != checkpointTopicPartitionCount) {
+                String msg = "Input stream topic " + streamTopicName + " partition count is " +
+                    streamTopicPartitionCount + " but checkpoint topic " +
+                    checkpointTopicName + " partition count is " + checkpointTopicPartitionCount +
+                    ".  The number of partitions in each topic must be the same.";
+                throw new KafkaCheckpointException(msg);
+            }
+
+            log.info("Successfully validated checkpoint topic {} for input stream topic {}: both have {} partitions}",
+                new Object[]{checkpointTopicName, streamTopicName, checkpointTopicPartitionCount});
+        }
     }
 
     @Override
     public String toString() {
-        return String.format("SinglePartitionKafkaCheckpointManager [systemName=%s, checkpointTopic=%s]",
-            systemName, checkpointTopic);
+        return getClass().getSimpleName() + "{systemName=" + systemName +
+            ", checkpointTopic=" + checkpointTopic + ", {" +
+            streamCheckpointTopicNames + "}";
     }
 
     private void retry(Consumer<ExponentialSleepStrategy.RetryLoop> c,

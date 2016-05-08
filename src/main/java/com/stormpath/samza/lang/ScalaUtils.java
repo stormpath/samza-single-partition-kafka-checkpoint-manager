@@ -1,4 +1,4 @@
-package com.stormpath.samza.kafka.checkpoint;
+package com.stormpath.samza.lang;
 
 import org.apache.samza.SamzaException;
 import scala.Option;
@@ -6,12 +6,20 @@ import scala.runtime.AbstractFunction0;
 import scala.runtime.AbstractFunction1;
 import scala.runtime.AbstractFunction2;
 
+import java.util.Optional;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 public class ScalaUtils {
+
+    public static <T> Optional<T> o(scala.Option<T> scalaOption) {
+        if (scalaOption.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(scalaOption.get());
+    }
 
     public static <T> T require(Option<? extends T> option, final String msg) {
         return option.getOrElse(new AbstractFunction0<T>() {

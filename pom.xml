@@ -63,6 +63,7 @@
         <jackson.version>2.4.4</jackson.version>
 
         <samza.version>0.9.1</samza.version>
+        <curator.version>2.10.0</curator.version>
 
         <!-- Test Dependencies: Only required for testing when building.  Not required at runtime: -->
         <groovy.version>1.8.8</groovy.version>
@@ -74,6 +75,18 @@
     </properties>
 
     <dependencies>
+
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-recipes</artifactId>
+            <version>${curator.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>log4j</groupId>
+                    <artifactId>log4j</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
 
         <dependency>
             <groupId>org.apache.samza</groupId>
@@ -91,6 +104,16 @@
             <groupId>org.apache.samza</groupId>
             <artifactId>samza-kafka_2.10</artifactId>
             <version>${samza.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.zookeeper</groupId>
+                    <artifactId>zookeeper</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>log4j</groupId>
+                    <artifactId>log4j</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- Test dependencies: -->

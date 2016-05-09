@@ -1,6 +1,5 @@
 package com.stormpath.samza.zookeeper.checkpoint;
 
-import com.stormpath.samza.lang.Collections;
 import com.stormpath.samza.lang.Strings;
 import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
@@ -10,10 +9,8 @@ import org.apache.samza.SamzaException;
 import org.apache.samza.checkpoint.CheckpointManager;
 import org.apache.samza.checkpoint.CheckpointManagerFactory;
 import org.apache.samza.config.Config;
-import org.apache.samza.config.TaskConfig$;
 import org.apache.samza.metrics.MetricsRegistry;
 
-import java.util.Set;
 import java.util.function.Supplier;
 
 @SuppressWarnings("Duplicates")
@@ -28,16 +25,8 @@ public class ZookeeperCheckpointManagerFactory implements CheckpointManagerFacto
         return val;
     }
 
-    protected Set<String> getTaskInputStreamNames(Config c) {
-        String val = getRequiredString(c, TaskConfig$.MODULE$.INPUT_STREAMS());
-        String[] arr = Strings.tokenizeToStringArray(val, ", ");
-        return Collections.setOf(arr);
-    }
-
     @Override
     public CheckpointManager getCheckpointManager(Config config, MetricsRegistry registry) {
-
-        //Set<String> inputStreamNames = getTaskInputStreamNames(config);
 
         //RetryPolicy
         int baseSleepTimeMs = config.getInt("task.checkpoint.zookeeper.client.retryPolicy.baseSleepTimeMs", 1000);
